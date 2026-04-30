@@ -44,7 +44,6 @@ simulate 456#AABBCCDD        # BLOCK (Unauthorized ID)
 # View stats
 stats
 ```
-## AUTOSAR Compliance Notes
 
 ## AUTOSAR Compliance Notes
 | Requirement | Status | Notes |
