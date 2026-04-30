@@ -46,5 +46,17 @@ stats
 ```
 ## AUTOSAR Compliance Notes
 
+## AUTOSAR Compliance Notes
+| Requirement | Status | Notes |
+| :--- | :---: | :--- |
+| **Whitelist ID Filtering** | ✅ | Default-deny for unknown IDs |
+| **DLC Validation** | ✅ | Classic & CAN FD compliant |
+| **Frequency Monitoring** | ✅ | Configurable min-interval anti-replay |
+| **Payload Length Check** | ✅ | Rule-based max payload limit |
+| **Thread Safety** | ✅ | Mutex-protected rule/stats access |
+
+> [!NOTE]
+> Designed for simulation, HIL testing, and educational use. Production deployment requires integration with AUTOSAR COM/PduR, NVM persistence, and secure update mechanisms per ISO 21434.
+
 ## License
 MIT License. See LICENSE for details.
