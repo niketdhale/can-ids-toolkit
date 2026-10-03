@@ -17,15 +17,27 @@ bool CanIdsEngine::isValidDlcFd(uint8_t dlc) {
 }
 
 bool CanIdsEngine::addRule(const CanIdsRule& rule) {
-    if (!rule.enabled || rule.valid_dlcs.empty() || rule.max_payload_bytes > 64) return false;
+    if (rule.id > (rule.is_extended ? 0x1FFFFFFFu : 0x7FFu)) return false;
+    auto key = makeRuleKey(rule.id, rule.is_extended);
+    if (!rule.enabled) {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_rules.erase(key);
+        m_last_rx_time.erase(key);
+        return false;
+    }
+    if (rule.valid_dlcs.empty() || rule.max_payload_bytes == 0 || rule.max_payload_bytes > 64) return false;
+    for (uint8_t d : rule.valid_dlcs) if (!isValidDlcFd(d)) return false;
     std::lock_guard<std::mutex> lock(m_mutex);
-    m_rules[makeRuleKey(rule.id, rule.is_extended)] = rule;
+    m_rules[key] = rule;
+    m_last_rx_time.erase(key);
     return true;
 }
 
 bool CanIdsEngine::removeRule(uint32_t id, bool is_extended) {
     std::lock_guard<std::mutex> lock(m_mutex);
-    return m_rules.erase(makeRuleKey(id, is_extended)) > 0;
+    auto key = makeRuleKey(id, is_extended);
+    m_last_rx_time.erase(key);
+    return m_rules.erase(key) > 0;
 }
 
 std::vector<CanIdsRule> CanIdsEngine::listRules() const {
@@ -36,12 +48,38 @@ std::vector<CanIdsRule> CanIdsEngine::listRules() const {
     return out;
 }
 
+void CanIdsEngine::recordBlocked(uint32_t id) {
+    m_stats.blocked_frames++;
+    auto it = m_stats.blocked_by_id.find(id);
+    if (it != m_stats.blocked_by_id.end()) it->second++;
+    else if (m_stats.blocked_by_id.size() < kMaxBlockedIds) m_stats.blocked_by_id[id] = 1;
+}
+
 CanIdsResult CanIdsEngine::validateFrame(const CanFrame& frame) {
     CanIdsResult res;
     if (!m_enabled) { res.status = CanIdsResult::Status::Valid; res.should_forward = true; return res; }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
+    CanIdsAlertCallback cb;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        res = validateLocked(frame);
+        if (!res.should_forward) cb = m_alert_cb;
+    }
+    if (cb) cb(frame, res);
+    return res;
+}
+
+CanIdsResult CanIdsEngine::validateLocked(const CanFrame& frame) {
+    CanIdsResult res;
     m_stats.total_frames++;
+
+    if (frame.data.size() > 64 || frame.id > (frame.is_extended ? 0x1FFFFFFFu : 0x7FFu)) {
+        res.status = frame.data.size() > 64 ? CanIdsResult::Status::LengthViolation : CanIdsResult::Status::InvalidId;
+        res.reason = frame.data.size() > 64 ? "Payload too large" : "CAN ID out of range";
+        res.should_forward = false;
+        recordBlocked(frame.id);
+        return res;
+    }
     auto key = makeRuleKey(frame.id, frame.is_extended);
     auto it = m_rules.find(key);
 
@@ -49,8 +87,7 @@ CanIdsResult CanIdsEngine::validateFrame(const CanFrame& frame) {
         res.status = CanIdsResult::Status::InvalidId;
         res.reason = "Unauthorized CAN ID";
         res.should_forward = false;
-        m_stats.blocked_frames++;
-        m_stats.blocked_by_id[frame.id]++;
+        recordBlocked(frame.id);
         return res;
     }
 
@@ -62,8 +99,7 @@ CanIdsResult CanIdsEngine::validateFrame(const CanFrame& frame) {
         res.status = CanIdsResult::Status::InvalidDlc;
         res.reason = "Invalid DLC " + std::to_string(dlc);
         res.should_forward = false;
-        m_stats.blocked_frames++;
-        m_stats.blocked_by_id[frame.id]++;
+        recordBlocked(frame.id);
         return res;
     }
 
@@ -71,22 +107,21 @@ CanIdsResult CanIdsEngine::validateFrame(const CanFrame& frame) {
         res.status = CanIdsResult::Status::LengthViolation;
         res.reason = "Payload exceeds max " + std::to_string(rule.max_payload_bytes);
         res.should_forward = false;
-        m_stats.blocked_frames++;
-        m_stats.blocked_by_id[frame.id]++;
+        recordBlocked(frame.id);
         return res;
     }
 
     if (rule.min_interval_ms > 0) {
-        auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+        auto now = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count());
         auto last_it = m_last_rx_time.find(key);
         if (last_it != m_last_rx_time.end()) {
             uint64_t delta = now - last_it->second;
-            if (delta < rule.min_interval_ms * 1000000ULL) {
+            if (delta < static_cast<uint64_t>(rule.min_interval_ms) * 1000000ULL) {
                 res.status = CanIdsResult::Status::FrequencyViolation;
                 res.reason = "Frame rate exceeded";
                 res.should_forward = false;
-                m_stats.blocked_frames++;
-                m_stats.blocked_by_id[frame.id]++;
+                recordBlocked(frame.id);
                 return res;
             }
         }
@@ -102,5 +137,5 @@ CanIdsResult CanIdsEngine::validateFrame(const CanFrame& frame) {
 CanIdsStats CanIdsEngine::getStats() const { std::lock_guard<std::mutex> lock(m_mutex); return m_stats; }
 void CanIdsEngine::resetStats() { std::lock_guard<std::mutex> lock(m_mutex); m_stats = CanIdsStats{}; m_last_rx_time.clear(); }
 void CanIdsEngine::setAlertCallback(CanIdsAlertCallback cb) { std::lock_guard<std::mutex> lock(m_mutex); m_alert_cb = std::move(cb); }
-void CanIdsEngine::setEnabled(bool enabled) { std::lock_guard<std::mutex> lock(m_mutex); m_enabled = enabled; }
+void CanIdsEngine::setEnabled(bool enabled) { m_enabled = enabled; }
 bool CanIdsEngine::isEnabled() const { return m_enabled; }
